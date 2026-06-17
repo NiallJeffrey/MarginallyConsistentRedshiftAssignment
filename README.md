@@ -110,25 +110,19 @@ $$
 
 ## Regularisation
 
-The problem is underdetermined. The two sets of $n(z)$ distributions do not uniquely specify:
+The problem is underdetermined: the supplied $n(z)$ distributions constrain the marginals but do not uniquely specify the full conditional $p(z \mid i_L, i_S)$, so many couplings $q_{\ell s}$ reproduce the same lens and source $n(z)$.
 
-$$
-p(z \mid i_L, i_S).
-$$
+A normalising flow, however, already carries its own inductive bias that picks a particular solution among these. The conditional density is not a free per-cell object: it comes from a single amortised conditioner network with weights shared across all $(\ell, s)$ (here, an additive lens-embedding plus source-embedding fed through a shared MLP), restricted to smooth monotonic spline transforms of a Gaussian base, and trained from a near-identity initialisation. These choices favour smooth solutions and let poorly-constrained cells borrow structure from well-constrained ones — for example an almost-empty $(\ell, s)$ cell is reconstructed from its lens-row and source-column neighbours rather than left arbitrary.
 
-Therefore, it is useful to add a reference density:
-
-$$
-r(z \mid i_L = \ell, i_S = s).
-$$
-
-One possible regularised objective is:
+One can also add an explicit regularisation penalty in the objective, pulling each conditional toward a reference density $r(z \mid i_L = \ell, i_S = s)$:
 
 $$
 \mathcal{L}(\theta) = \sum_\ell \mathrm{KL}\left(n^L_\ell \,\|\, \hat{n}^L_{\ell,\theta}\right) + \sum_s \mathrm{KL}\left(n^S_s \,\|\, \hat{n}^S_{s,\theta}\right) + \lambda \sum_{\ell,s} \mathrm{KL}\left(q_\theta(z \mid i_L = \ell, i_S = s) \,\|\, r(z \mid i_L = \ell, i_S = s)\right).
 $$
 
-The first two terms enforce agreement with the supplied lens and source $n(z)$ distributions. The final term chooses a particular solution among the many possible couplings, for example by favouring smoothness, maximum entropy, or proximity to a physically motivated prior.
+The first two terms enforce agreement with the supplied $n(z)$ distributions, while the final term selects a particular coupling, for example by favouring smoothness, maximum entropy, or proximity to a physically motivated prior.
+
+In practice, though, we find this explicit penalty is not very useful. Since the objective is a soft weighted sum rather than a hard constraint, any non-trivial $\lambda$ degrades the marginal fit, and pulling the conditionals toward a generic reference (e.g. a broad Gaussian) mostly fights the flow's own, better-matched inductive bias — making the recovered conditionals worse, especially in sparsely-populated cells. The implementation therefore omits it and optimises the forward-KL objective alone.
 
 ---
 
@@ -182,11 +176,3 @@ mcra.train(model, data, mcra.TrainConfig(steps=2000))
 i_l, i_s, _ = mcra.sample_catalogue(data, n=100_000)
 z = mcra.assign_redshifts(model, i_l, i_s)
 ```
-
-### A note on the explicit regularisation term
-
-The formalism above includes an optional regularisation term $\lambda\sum_{\ell,s}\mathrm{KL}\big(q_\theta(\cdot\mid\ell,s)\,\|\,r\big)$ to pick a particular solution among the many couplings consistent with the marginals. We tested this in the demo and found that **it did not improve the result** — with any non-trivial weight it degraded the recovered conditionals (most visibly in sparsely-populated $(\ell,s)$ cells), and the marginal fit got worse, since the objective is a soft weighted sum rather than a hard constraint.
-
-The likely explanation is that the explicit term was **fighting the implicit regularisation (inductive bias) already built into the flow**. The conditional density is not a free per-cell object: it is produced by a single amortised conditioner network with weights shared across all $(\ell,s)$ (an additive lens-embedding + source-embedding fed through a shared MLP), restricted to smooth monotonic rational-quadratic spline transforms of a Gaussian base, and trained from a near-identity initialisation. These choices already select a smooth, sensible solution in the underdetermined directions — for example, an almost-empty cell is reconstructed from its lens-row and source-column neighbours rather than left arbitrary. Adding an explicit reference (a broad Gaussian, deliberately *not* a Smail) simply competed with this better-matched implicit prior.
-
-Accordingly, the explicit regularisation term has been **removed from the implementation**: `mcra.train` optimises the forward-KL objective alone, and the flow's own inductive bias does the work of selecting a solution. (It could be reinstated with a carefully chosen reference for genuinely incompatible inputs, but it was not helpful here.)
