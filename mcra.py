@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -52,6 +52,14 @@ __all__ = [
     "plot_marginals",
     "plot_conditionals",
     "plot_catalogue",
+    # Partial sample-membership extension
+    "PartialDemoData",
+    "make_partial_demo",
+    "sample_partial_catalogue",
+    "to_model_slots",
+    "plot_partial_marginals",
+    "plot_partial_conditionals",
+    "plot_partial_catalogue",
 ]
 
 
@@ -165,6 +173,11 @@ class SelectionDensity:
     ``p(source=s | z)``, and ``p_bin = int sel(z) n_pop(z) dz`` is the bin
     occupancy. With lens windows centred below source windows, lens bins sit at
     slightly lower redshift than source bins while overlapping.
+
+    Additional multiplicative selection factors (callables ``z -> weight`` in
+    ``[0, 1]``) can be supplied via ``factors``; these are used by the partial
+    sample-membership extension to encode sample-membership probabilities
+    ``pi_L(z)``, ``pi_S(z)`` and their complements.
     """
 
     def __init__(
@@ -176,6 +189,7 @@ class SelectionDensity:
         width: float = 0.12,
         l: Optional[int] = None,
         s: Optional[int] = None,
+        factors: Optional[Sequence[Callable[[torch.Tensor], torch.Tensor]]] = None,
     ):
         self.population = population
         self.z_grid = z_grid
@@ -184,6 +198,7 @@ class SelectionDensity:
         self.width = width
         self.l = l
         self.s = s
+        self.factors = list(factors) if factors is not None else []
         sel = self._selection(z_grid)
         npop = population.pdf(z_grid)
         self.p_bin = float(torch.trapezoid(sel * npop, z_grid))
@@ -195,6 +210,8 @@ class SelectionDensity:
             sel = sel * gaussian_windows(z, self.lens_centers, self.width)[..., self.l]
         if self.s is not None:
             sel = sel * gaussian_windows(z, self.source_centers, self.width)[..., self.s]
+        for factor in self.factors:
+            sel = sel * factor(z)
         return sel
 
     def pdf(self, z: torch.Tensor) -> torch.Tensor:
@@ -354,6 +371,217 @@ def sample_catalogue(data: DemoData, n: int, seed: Optional[int] = None):
 
 
 # ---------------------------------------------------------------------------
+# Extension: partial sample membership
+# ---------------------------------------------------------------------------
+# A galaxy may belong to only one sample. We augment each label space with an
+# "absent" token. Internally the absent token is encoded as the *last* slot, so
+# real lens bins keep their indices 0..L-1 with absent = L, and real source bins
+# keep 0..S-1 with absent = S. A flow with n_lens=L+1, n_source=S+1 then covers
+# the augmented grid. Public catalogue arrays use -1 for the absent token.
+@dataclass
+class PartialDemoData:
+    """Synthetic demo where some galaxies are absent from one sample.
+
+    The solver may use the real-bin targets (:attr:`lens_targets`,
+    :attr:`source_targets`) and the catalogue label statistics
+    (:attr:`p_s_given_l` of shape ``[L, S+1]`` and :attr:`p_l_given_s` of shape
+    ``[L+1, S]``, both including the absent token). The true conditionals
+    :attr:`cond` (an ``(L+1) x (S+1)`` grid with the ``(absent, absent)`` corner
+    set to ``None``) are kept only to check the recovered solution.
+    """
+
+    n_lens: int  # number of real lens bins, L
+    n_source: int  # number of real source bins, S
+    lens_absent_slot: int  # = L
+    source_absent_slot: int  # = S
+    population: Smail
+    lens_centers: np.ndarray
+    source_centers: np.ndarray
+    width: float
+    pi_lens: Callable[[torch.Tensor], torch.Tensor]  # P(in lens sample | z)
+    pi_source: Callable[[torch.Tensor], torch.Tensor]  # P(in source sample | z)
+    p_s_given_l: np.ndarray  # [L, S+1], last column = absent source
+    p_l_given_s: np.ndarray  # [L+1, S], last row = absent lens
+    cond: List[List[Optional[SelectionDensity]]]  # [L+1][S+1], corner None
+    lens_targets: List[SelectionDensity]  # length L
+    source_targets: List[SelectionDensity]  # length S
+    lens_bins: List[int]  # real lens bin indices, range(L)
+    source_bins: List[int]  # real source bin indices, range(S)
+    z_mean: float
+    z_std: float
+    z_max: float
+    z_grid: torch.Tensor = field(repr=False, default=None)
+
+
+def _sigmoid_drop(z_cut: float, w: float) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Membership probability that is ~1 at low z and falls to ~0 above z_cut."""
+    return lambda z: torch.sigmoid(-(torch.as_tensor(z, dtype=torch.float32) - z_cut) / w)
+
+
+def _sigmoid_rise(z_cut: float, w: float) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Membership probability that is ~0 at low z and rises to ~1 above z_cut."""
+    return lambda z: torch.sigmoid((torch.as_tensor(z, dtype=torch.float32) - z_cut) / w)
+
+
+def make_partial_demo(
+    alpha: float = 2.0,
+    beta: float = 1.5,
+    pop_scale: float = 0.55,
+    lens_centers: Sequence[float] = (0.30, 0.45, 0.60),
+    source_centers: Sequence[float] = (0.50, 0.80, 1.10),
+    width: float = 0.13,
+    lens_membership: Sequence[float] = (0.70, 0.10),
+    source_membership: Sequence[float] = (0.30, 0.15),
+    z_max: float = 2.5,
+    n_grid: int = 4000,
+) -> PartialDemoData:
+    """Build a synthetic demo with partial sample membership.
+
+    A parent Smail population ``n(z)`` is split into a lens sample (present with
+    probability ``pi_L(z)``, high at low z and dropping above ``lens_membership``
+    cutoff) and a source sample (present with probability ``pi_S(z)``, rising with
+    z). Within each sample, soft Gaussian windows define the tomographic bins. A
+    galaxy is catalogued if it belongs to at least one sample; high-redshift
+    galaxies are sources with no lens bin, and the lowest-redshift galaxies may be
+    lenses with no source bin. Membership and bin assignment are independent given
+    ``z``, so the true conditionals are
+
+    ``q*_{l,s} ~ pi_L w^L_l . pi_S w^S_s . n``,
+    ``q*_{l,absent} ~ pi_L w^L_l . (1 - pi_S) . n``,
+    ``q*_{absent,s} ~ (1 - pi_L) . pi_S w^S_s . n``,
+
+    and the supplied real-bin targets are ``n^L_l ~ pi_L w^L_l n`` and
+    ``n^S_s ~ pi_S w^S_s n``.
+    """
+    lens_centers = np.asarray(lens_centers, dtype=float)
+    source_centers = np.asarray(source_centers, dtype=float)
+    L = len(lens_centers)
+    S = len(source_centers)
+
+    population = Smail(pop_scale, alpha, beta)
+    z_grid = torch.linspace(1e-3, z_max, n_grid)
+
+    pi_L = _sigmoid_drop(*lens_membership)
+    pi_S = _sigmoid_rise(*source_membership)
+
+    def w_L(l):
+        return lambda z: gaussian_windows(z, lens_centers, width)[..., l]
+
+    def w_S(s):
+        return lambda z: gaussian_windows(z, source_centers, width)[..., s]
+
+    def comp_pi_S(z):
+        return 1.0 - pi_S(z)
+
+    def comp_pi_L(z):
+        return 1.0 - pi_L(z)
+
+    def density(factors):
+        return SelectionDensity(population, z_grid, factors=factors)
+
+    # Real-bin targets: n^L_l ~ pi_L w^L_l n,  n^S_s ~ pi_S w^S_s n.
+    lens_targets = [density([pi_L, w_L(l)]) for l in range(L)]
+    source_targets = [density([pi_S, w_S(s)]) for s in range(S)]
+
+    # True conditionals on the augmented (L+1) x (S+1) grid (corner excluded).
+    cond: List[List[Optional[SelectionDensity]]] = [
+        [None for _ in range(S + 1)] for _ in range(L + 1)
+    ]
+    for l in range(L):
+        for s in range(S):
+            cond[l][s] = density([pi_L, w_L(l), pi_S, w_S(s)])  # interior
+        cond[l][S] = density([pi_L, w_L(l), comp_pi_S])  # lens-only border
+    for s in range(S):
+        cond[L][s] = density([comp_pi_L, pi_S, w_S(s)])  # source-only border
+    # cond[L][S] stays None: galaxies in neither sample are unobserved.
+
+    # Co-occurrence including the absent token, normalised within each real bin.
+    p_s_given_l = np.zeros((L, S + 1), dtype=float)
+    for l in range(L):
+        denom = lens_targets[l].p_bin  # = int pi_L w^L_l n
+        for s in range(S):
+            p_s_given_l[l, s] = cond[l][s].p_bin / denom
+        p_s_given_l[l, S] = cond[l][S].p_bin / denom
+
+    p_l_given_s = np.zeros((L + 1, S), dtype=float)
+    for s in range(S):
+        denom = source_targets[s].p_bin  # = int pi_S w^S_s n
+        for l in range(L):
+            p_l_given_s[l, s] = cond[l][s].p_bin / denom
+        p_l_given_s[L, s] = cond[L][s].p_bin / denom
+
+    z_mean = population.moment(1)
+    z_std = math.sqrt(max(population.moment(2) - z_mean ** 2, 1e-6))
+
+    return PartialDemoData(
+        n_lens=L,
+        n_source=S,
+        lens_absent_slot=L,
+        source_absent_slot=S,
+        population=population,
+        lens_centers=lens_centers,
+        source_centers=source_centers,
+        width=width,
+        pi_lens=pi_L,
+        pi_source=pi_S,
+        p_s_given_l=p_s_given_l,
+        p_l_given_s=p_l_given_s,
+        cond=cond,
+        lens_targets=lens_targets,
+        source_targets=source_targets,
+        lens_bins=list(range(L)),
+        source_bins=list(range(S)),
+        z_mean=z_mean,
+        z_std=z_std,
+        z_max=z_max,
+        z_grid=z_grid,
+    )
+
+
+def sample_partial_catalogue(data: PartialDemoData, n: int, seed: Optional[int] = None):
+    """Draw galaxies ``(i_L, i_S, z)`` from the partial-membership model.
+
+    Sample ``z ~ n(z)``; with probability ``pi_L(z)`` the galaxy is in the lens
+    sample and gets a lens bin (else ``-1``), and likewise for the source sample.
+    Galaxies in neither sample are discarded (unobserved). The returned label
+    arrays use ``-1`` for the absent token. ``n`` is the number of *parent* draws;
+    the returned catalogue is slightly smaller after discarding (absent, absent).
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+    z = data.population.sample(n)
+
+    in_lens = torch.rand(n) < data.pi_lens(z)
+    in_source = torch.rand(n) < data.pi_source(z)
+
+    lbin = torch.multinomial(gaussian_windows(z, data.lens_centers, data.width), 1).squeeze(-1)
+    sbin = torch.multinomial(gaussian_windows(z, data.source_centers, data.width), 1).squeeze(-1)
+
+    i_l = torch.where(in_lens, lbin, torch.full_like(lbin, -1))
+    i_s = torch.where(in_source, sbin, torch.full_like(sbin, -1))
+
+    keep = in_lens | in_source
+    return (
+        i_l[keep].numpy().astype(np.int64),
+        i_s[keep].numpy().astype(np.int64),
+        z[keep].numpy().astype(np.float32),
+    )
+
+
+def to_model_slots(i_l: np.ndarray, i_s: np.ndarray, data: PartialDemoData):
+    """Map public catalogue labels (``-1`` = absent) to model slot indices.
+
+    Absent lens labels map to slot ``L`` and absent source labels to slot ``S``,
+    matching the flow built with ``n_lens=L+1``, ``n_source=S+1``.
+    """
+    i_l = np.asarray(i_l).copy()
+    i_s = np.asarray(i_s).copy()
+    i_l[i_l < 0] = data.lens_absent_slot
+    i_s[i_s < 0] = data.source_absent_slot
+    return i_l, i_s
+
+
+# ---------------------------------------------------------------------------
 # Conditional spline flow
 # ---------------------------------------------------------------------------
 class ConditionalRedshiftFlow(nn.Module):
@@ -453,6 +681,18 @@ def model_source_log_density(
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+def _lens_bins(model, data) -> List[int]:
+    """Real lens bins that carry a supplied target (all of them unless the data
+    object declares a subset, as in the partial-membership extension)."""
+    bins = getattr(data, "lens_bins", None)
+    return list(bins) if bins is not None else list(range(model.n_lens))
+
+
+def _source_bins(model, data) -> List[int]:
+    bins = getattr(data, "source_bins", None)
+    return list(bins) if bins is not None else list(range(model.n_source))
+
+
 @dataclass
 class TrainConfig:
     steps: int = 4000
@@ -494,17 +734,20 @@ def train(
     opt = torch.optim.Adam(model.parameters(), lr=config.lr)
     history = {"loss": [], "lens_kl": [], "source_kl": []}
 
+    lens_bins = _lens_bins(model, data)
+    source_bins = _source_bins(model, data)
+
     for step in range(config.steps):
         opt.zero_grad()
 
         lens_loss = torch.zeros((), device=device)
-        for l in range(model.n_lens):
-            z = data.lens_targets[l].sample(config.batch_size).to(device)
+        for li, l in enumerate(lens_bins):
+            z = data.lens_targets[li].sample(config.batch_size).to(device)
             lens_loss = lens_loss - model_lens_log_density(model, z, l, data.p_s_given_l).mean()
 
         source_loss = torch.zeros((), device=device)
-        for s in range(model.n_source):
-            z = data.source_targets[s].sample(config.batch_size).to(device)
+        for si, s in enumerate(source_bins):
+            z = data.source_targets[si].sample(config.batch_size).to(device)
             source_loss = source_loss - model_source_log_density(model, z, s, data.p_l_given_s).mean()
 
         loss = lens_loss + source_loss
@@ -566,20 +809,20 @@ def marginal_metrics(model: ConditionalRedshiftFlow, data: DemoData, n_grid: int
     out = {"lens_kl": [], "lens_l1": [], "source_kl": [], "source_l1": []}
     eps = 1e-12
 
-    for l in range(model.n_lens):
-        target = data.lens_targets[l].pdf(zgrid.cpu()).numpy()
+    for li, l in enumerate(_lens_bins(model, data)):
+        target = data.lens_targets[li].pdf(zgrid.cpu()).numpy()
         implied = _density_on_grid(
-            lambda z: model_lens_log_density(model, z, l, data.p_s_given_l), zgrid
+            lambda z, l=l: model_lens_log_density(model, z, l, data.p_s_given_l), zgrid
         )
         kl = float(np.sum(target * (np.log(target + eps) - np.log(implied + eps))) * dz)
         l1 = float(np.sum(np.abs(target - implied)) * dz)
         out["lens_kl"].append(kl)
         out["lens_l1"].append(l1)
 
-    for s in range(model.n_source):
-        target = data.source_targets[s].pdf(zgrid.cpu()).numpy()
+    for si, s in enumerate(_source_bins(model, data)):
+        target = data.source_targets[si].pdf(zgrid.cpu()).numpy()
         implied = _density_on_grid(
-            lambda z: model_source_log_density(model, z, s, data.p_l_given_s), zgrid
+            lambda z, s=s: model_source_log_density(model, z, s, data.p_l_given_s), zgrid
         )
         kl = float(np.sum(target * (np.log(target + eps) - np.log(implied + eps))) * dz)
         l1 = float(np.sum(np.abs(target - implied)) * dz)
@@ -605,38 +848,40 @@ def plot_marginals(model: ConditionalRedshiftFlow, data: DemoData, n_grid: int =
     zgrid = _zgrid(data, n_grid)
     zgrid_d = zgrid.to(device)
 
-    n_cols = max(model.n_lens, model.n_source)
-    fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 7), sharex=True)
+    lens_bins = _lens_bins(model, data)
+    source_bins = _source_bins(model, data)
+    n_cols = max(len(lens_bins), len(source_bins))
+    fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 7), sharex=True, squeeze=False)
 
-    for l in range(model.n_lens):
-        ax = axes[0, l]
-        target = data.lens_targets[l].pdf(zgrid).numpy()
+    for li, l in enumerate(lens_bins):
+        ax = axes[0, li]
+        target = data.lens_targets[li].pdf(zgrid).numpy()
         implied = _density_on_grid(
-            lambda z: model_lens_log_density(model, z, l, data.p_s_given_l), zgrid_d
+            lambda z, l=l: model_lens_log_density(model, z, l, data.p_s_given_l), zgrid_d
         )
         ax.plot(zgrid.numpy(), target, "k-", lw=2, label="target $n^L_\\ell$")
         ax.plot(zgrid.numpy(), implied, "C3--", lw=2, label="implied $\\hat n^L_\\ell$")
         ax.set_title(f"Lens bin {l}")
         ax.set_ylabel("density")
-        if l == 0:
+        if li == 0:
             ax.legend()
 
-    for s in range(model.n_source):
-        ax = axes[1, s]
-        target = data.source_targets[s].pdf(zgrid).numpy()
+    for si, s in enumerate(source_bins):
+        ax = axes[1, si]
+        target = data.source_targets[si].pdf(zgrid).numpy()
         implied = _density_on_grid(
-            lambda z: model_source_log_density(model, z, s, data.p_l_given_s), zgrid_d
+            lambda z, s=s: model_source_log_density(model, z, s, data.p_l_given_s), zgrid_d
         )
         ax.plot(zgrid.numpy(), target, "k-", lw=2, label="target $n^S_s$")
         ax.plot(zgrid.numpy(), implied, "C0--", lw=2, label="implied $\\hat n^S_s$")
         ax.set_title(f"Source bin {s}")
         ax.set_xlabel("redshift $z$")
         ax.set_ylabel("density")
-        if s == 0:
+        if si == 0:
             ax.legend()
 
     # blank any unused axes
-    for row, count in ((0, model.n_lens), (1, model.n_source)):
+    for row, count in ((0, len(lens_bins)), (1, len(source_bins))):
         for c in range(count, n_cols):
             axes[row, c].axis("off")
 
@@ -726,5 +971,112 @@ def plot_catalogue(
             axes[row, c].axis("off")
 
     fig.suptitle("Assigned-catalogue redshifts vs supplied targets", y=1.02)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Plotting helpers for the partial sample-membership extension
+# ---------------------------------------------------------------------------
+def plot_partial_marginals(model: ConditionalRedshiftFlow, data: PartialDemoData, n_grid: int = 400):
+    """Supplied real-bin targets vs model-implied marginals (sums over absent)."""
+    return plot_marginals(model, data, n_grid=n_grid)
+
+
+@torch.no_grad()
+def plot_partial_conditionals(model: ConditionalRedshiftFlow, data: PartialDemoData, n_grid: int = 400):
+    """Recovered ``q_theta(z | a, b)`` over the augmented grid, incl. the border
+    cells with one ``absent`` label, overlaid with the known truth. The
+    ``(absent, absent)`` corner is unobserved and left blank."""
+    import matplotlib.pyplot as plt
+
+    device = next(model.parameters()).device
+    zgrid = _zgrid(data, n_grid)
+    zgrid_d = zgrid.to(device)
+
+    nL = data.n_lens + 1  # rows incl. absent lens (last)
+    nS = data.n_source + 1  # cols incl. absent source (last)
+    fig, axes = plt.subplots(nL, nS, figsize=(3.0 * nS, 2.6 * nL), sharex=True, sharey=True, squeeze=False)
+
+    def label(idx, absent_idx, kind):
+        return f"{kind}=\u2205" if idx == absent_idx else f"{kind}={idx}"
+
+    for a in range(nL):
+        for b in range(nS):
+            ax = axes[a, b]
+            if data.cond[a][b] is None:
+                ax.axis("off")
+                continue
+            true = data.cond[a][b].pdf(zgrid).numpy()
+            i_l = torch.full_like(zgrid_d, a, dtype=torch.long)
+            i_s = torch.full_like(zgrid_d, b, dtype=torch.long)
+            learned = torch.exp(model.log_prob(zgrid_d, i_l, i_s)).cpu().numpy()
+            border = (a == data.lens_absent_slot) or (b == data.source_absent_slot)
+            ax.plot(zgrid.numpy(), true, "k-", lw=2, label="true $q^*$")
+            ax.plot(zgrid.numpy(), learned, ("C1--" if border else "C2--"), lw=2, label="learned")
+            ttl = f"${label(a, data.lens_absent_slot, 'l')},\\ {label(b, data.source_absent_slot, 's')}$"
+            ax.set_title(ttl + ("  (border)" if border else ""), fontsize=8)
+            if a == nL - 1:
+                ax.set_xlabel("$z$")
+            if b == 0:
+                ax.set_ylabel("density")
+            if a == 0 and b == 0:
+                ax.legend(fontsize=8)
+
+    fig.suptitle("Recovered conditionals on the augmented grid ($\\varnothing$ = absent)", y=1.01)
+    fig.tight_layout()
+    return fig
+
+
+def plot_partial_catalogue(
+    model: ConditionalRedshiftFlow,
+    data: PartialDemoData,
+    n: int = 400_000,
+    seed: int = 1,
+    n_grid: int = 400,
+):
+    """Sample a partial catalogue, assign redshifts (incl. single-sample
+    galaxies), and histogram each real bin against its supplied target."""
+    import matplotlib.pyplot as plt
+
+    i_l, i_s, _ = sample_partial_catalogue(data, n, seed=seed)
+    sl, ss = to_model_slots(i_l, i_s, data)
+    z_assigned = assign_redshifts(model, sl, ss)
+    zgrid = _zgrid(data, n_grid).numpy()
+
+    n_cols = max(data.n_lens, data.n_source)
+    fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 7), sharex=True, squeeze=False)
+
+    for l in range(data.n_lens):
+        ax = axes[0, l]
+        sel = z_assigned[i_l == l]
+        ax.hist(sel, bins=60, density=True, alpha=0.5, color="C3", label="assigned")
+        ax.plot(zgrid, data.lens_targets[l].pdf(torch.tensor(zgrid)).numpy(), "k-", lw=2, label="target")
+        ax.set_title(f"Lens bin {l}")
+        ax.set_ylabel("density")
+        if l == 0:
+            ax.legend()
+
+    for s in range(data.n_source):
+        ax = axes[1, s]
+        sel = z_assigned[i_s == s]
+        ax.hist(sel, bins=60, density=True, alpha=0.5, color="C0", label="assigned")
+        ax.plot(zgrid, data.source_targets[s].pdf(torch.tensor(zgrid)).numpy(), "k-", lw=2, label="target")
+        ax.set_title(f"Source bin {s}")
+        ax.set_xlabel("redshift $z$")
+        ax.set_ylabel("density")
+        if s == 0:
+            ax.legend()
+
+    for row, count in ((0, data.n_lens), (1, data.n_source)):
+        for c in range(count, n_cols):
+            axes[row, c].axis("off")
+
+    n_src_only = int(np.sum((i_l < 0) & (i_s >= 0)))
+    n_lens_only = int(np.sum((i_s < 0) & (i_l >= 0)))
+    fig.suptitle(
+        f"Partial catalogue: {n_src_only:,} source-only and {n_lens_only:,} lens-only galaxies",
+        y=1.02,
+    )
     fig.tight_layout()
     return fig

@@ -144,12 +144,75 @@ This produces a redshift assignment whose lens-bin and source-bin ensembles appr
 
 ---
 
+## Extension: galaxies absent from a sample
+
+So far every galaxy carries both a lens label and a source label. In practice the two samples need not coincide: the source sample typically extends to higher redshift than the lens sample, so many galaxies appear as sources but have no lens-bin assignment (and, less often, vice versa). We model this by augmenting each label space with an explicit **absent** token $\varnothing$ (the value coded as `-1` in a catalogue):
+
+$$
+i_L \in \{1, \dots, L\} \cup \{\varnothing\}, \qquad i_S \in \{1, \dots, S\} \cup \{\varnothing\}.
+$$
+
+A galaxy is in the catalogue if it belongs to at least one sample, so every galaxy has at least one real label and the corner $(\varnothing, \varnothing)$ is unobserved and excluded:
+
+$$
+\mathcal{C} = \big(\{1, \dots, L\} \cup \{\varnothing\}\big) \times \big(\{1, \dots, S\} \cup \{\varnothing\}\big) \setminus \{(\varnothing, \varnothing)\}.
+$$
+
+The conditional family $q_{\ell s}(z)$ is extended over all observed label pairs $(\ell, s) \in \mathcal{C}$, including the **border** densities $q_{\ell \varnothing}(z)$ (galaxies in lens bin $\ell$ that are not sources) and $q_{\varnothing s}(z)$ (galaxies in source bin $s$ that are not lenses).
+
+### Modified marginals
+
+Crucially, the supplied targets exist **only for the real bins** — there is no supplied $n(z)$ for the absent token. The catalogue label statistics, however, are estimated over the augmented index (the absent token included), and the model-implied marginals must sum over it:
+
+$$
+\hat{n}^L_{\ell,\theta}(z) = \sum_{b \in \{1, \dots, S\} \cup \{\varnothing\}} p(i_S = b \mid i_L = \ell)\, q_\theta(z \mid i_L = \ell, i_S = b),
+$$
+
+$$
+\hat{n}^S_{s,\theta}(z) = \sum_{a \in \{1, \dots, L\} \cup \{\varnothing\}} p(i_L = a \mid i_S = s)\, q_\theta(z \mid i_L = a, i_S = s).
+$$
+
+The forward-KL objective is unchanged in form but is summed over the real bins only, since these are the only bins with a supplied target:
+
+$$
+\mathcal{L}_{\mathrm{KL}}(\theta) = -\sum_{\ell=1}^{L} \mathbb{E}_{z \sim n^L_\ell}\!\left[\log \hat{n}^L_{\ell,\theta}(z)\right] - \sum_{s=1}^{S} \mathbb{E}_{z \sim n^S_s}\!\left[\log \hat{n}^S_{s,\theta}(z)\right].
+$$
+
+The border conditionals $q_{\ell\varnothing}$ and $q_{\varnothing s}$ carry no target term of their own; they are learned implicitly through the mixtures of the real bins in which they appear.
+
+### What changes mathematically
+
+- **Global compatibility is lost.** In the original problem the two sets of marginals shared a common total density, $\sum_\ell p(i_L = \ell)\, n^L_\ell = \sum_s p(i_S = s)\, n^S_s = n_{\mathrm{pop}}(z)$. With partial membership this no longer holds: $\sum_\ell p(i_L = \ell)\, n^L_\ell$ is the redshift density of the *lens sample* and $\sum_s p(i_S = s)\, n^S_s$ that of the *source sample*, and the two samples cover different redshift ranges. The only remaining cross-consistency is that the shared interior conditionals $q_{\ell s}$ are a single object entering both families of mixtures.
+
+- **The border conditionals are residuals.** $q_{\ell\varnothing}$ appears only in $\hat{n}^L_\ell$. Given the interior conditionals $q_{\ell s}$ (which are pinned by the source-side constraints), it is fixed by
+
+$$
+p(i_S = \varnothing \mid i_L = \ell)\, q_{\ell\varnothing}(z) = n^L_\ell(z) - \sum_{s=1}^{S} p(i_S = s \mid i_L = \ell)\, q_{\ell s}(z).
+$$
+
+For this to define a valid density the right-hand side must be pointwise non-negative and integrate to $p(i_S = \varnothing \mid i_L = \ell)$ — a feasibility condition on the inputs. The analogous statement holds for $q_{\varnothing s}$.
+
+- **Degenerate limits.** If $p(i_S = \varnothing \mid i_L = \ell) = 0$ (every lens-$\ell$ galaxy is also a source), the cell $q_{\ell\varnothing}$ has zero weight and is irrelevant. If a source bin $s$ has no lens overlap, $p(i_L = \varnothing \mid i_S = s) = 1$ and $q_{\varnothing s} = n^S_s$ exactly.
+
+### Assignment
+
+After training, every catalogued galaxy is assigned a redshift by sampling its conditional, exactly as before — including the single-sample galaxies, which draw from the inferred border conditionals:
+
+$$
+z_g \sim q_\theta\!\left(z \mid i_L(g), i_S(g)\right), \qquad (i_L(g), i_S(g)) \in \mathcal{C}.
+$$
+
+This is the practical payoff: it yields self-consistent redshifts for, for example, the high-redshift source-only galaxies that have no lens-bin counterpart.
+
+---
+
 ## Demo / usage
 
 A self-contained reference implementation in PyTorch is provided here:
 
 - [`mcra.py`](mcra.py) — the implementation. The conditional density $q_\theta(z\mid i_L, i_S)$ is a conditional rational-quadratic neural spline flow ([`zuko.flows.NSF`](https://zuko.readthedocs.io/)). It contains the Smail-type demo data generator (`make_demo_data`), the flow (`ConditionalRedshiftFlow`), the model-implied lens/source mixtures, the forward-KL training loop (`train`), and plotting/metric helpers.
 - [`demo.ipynb`](demo.ipynb) — an end-to-end walkthrough on a synthetic universe with **3 lens bins and 3 source bins**, all overlapping, with the lens bins at slightly lower redshift than the source bins. It generates the data, trains the flow, and shows that the model-implied marginals and the sampled-catalogue redshifts reproduce the supplied per-bin $n(z)$.
+- [`demo_partial.ipynb`](demo_partial.ipynb) — the *partial sample membership* extension (see above): a universe where the lens sample is suppressed at high redshift, so a fraction of source galaxies have no lens bin. It trains with the augmented "absent" token, recovers the real-bin marginals, assigns redshifts to source-only galaxies, and inspects the inferred border conditionals.
 
 ### Setup
 
