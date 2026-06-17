@@ -92,45 +92,15 @@ $$
 
 ## Learning the conditional densities
 
-In practice, parameterise the conditional densities as:
+In practice, parameterise the conditional densities as $q_{\ell s}(z) = q_\theta(z \mid i_L = \ell, i_S = s)$ — for example a conditional normalising flow $z = f_\theta(u; \ell, s)$ with $u \sim p_0(u)$. Substituting $q_\theta$ for $q_{\ell s}$ in the model-implied densities $\hat{n}^L_\ell$ and $\hat{n}^S_s$ defined above gives the model-implied mixtures $\hat{n}^L_{\ell,\theta}$ and $\hat{n}^S_{s,\theta}$.
+
+We learn $\theta$ by minimising KL-type discrepancies between the supplied $n(z)$ distributions and these model-implied mixtures. A natural forward-KL objective is:
 
 $$
-q_\theta(z \mid i_L = \ell, i_S = s).
+\mathcal{L}_{\mathrm{KL}}(\theta) = -\sum_\ell \int n^L_\ell(z) \log \hat{n}^L_{\ell,\theta}(z)\,dz - \sum_s \int n^S_s(z) \log \hat{n}^S_{s,\theta}(z)\,dz + \mathrm{constant},
 $$
 
-For example, one could use a conditional normalising flow:
-
-$$
-z = f_\theta(u; \ell, s),
-$$
-
-with
-
-$$
-u \sim p_0(u).
-$$
-
-The model-implied lens redshift density is:
-
-$$
-\hat{n}^L_{\ell,\theta}(z) = \sum_s p(i_S = s \mid i_L = \ell) q_\theta(z \mid i_L = \ell, i_S = s).
-$$
-
-The model-implied source redshift density is:
-
-$$
-\hat{n}^S_{s,\theta}(z) = \sum_\ell p(i_L = \ell \mid i_S = s) q_\theta(z \mid i_L = \ell, i_S = s).
-$$
-
-We then learn $\theta$ by minimizing KL-type discrepancies between the supplied $n(z)$ distributions and the model-implied mixtures.
-
-A natural forward-KL objective is:
-
-$$
-\mathcal{L}_{\mathrm{KL}}(\theta) = -\sum_\ell \int n^L_\ell(z) \log \hat{n}^L_{\ell,\theta}(z)\,dz - \sum_s \int n^S_s(z) \log \hat{n}^S_{s,\theta}(z)\,dz + \mathrm{constant}.
-$$
-
-If the supplied $n(z)$ distributions can be sampled from, this can be written as:
+which, when the supplied $n(z)$ distributions can be sampled from, is equivalent to:
 
 $$
 \mathcal{L}_{\mathrm{KL}}(\theta) = -\sum_\ell \mathbb{E}_{z \sim n^L_\ell}\left[\log \hat{n}^L_{\ell,\theta}(z)\right] - \sum_s \mathbb{E}_{z \sim n^S_s}\left[\log \hat{n}^S_{s,\theta}(z)\right] + \mathrm{constant}.
@@ -166,38 +136,57 @@ The first two terms enforce agreement with the supplied lens and source $n(z)$ d
 
 1. Estimate $p(i_S = s \mid i_L = \ell)$ and $p(i_L = \ell \mid i_S = s)$ directly from the catalogue labels.
 
-2. Introduce a learnable conditional density:
+2. Introduce a learnable conditional density $q_\theta(z \mid i_L = \ell, i_S = s)$, represented by a conditional normalising flow, spline density, mixture model, neural density estimator, or another normalised density model.
 
-$$
-q_\theta(z \mid i_L = \ell, i_S = s).
-$$
+3. Form the model-implied lens and source mixtures $\hat{n}^L_{\ell,\theta}$ and $\hat{n}^S_{s,\theta}$ as defined above, and optimise the forward-KL objective $\mathcal{L}_{\mathrm{KL}}(\theta)$. A reference density may optionally be added to select among solutions, but is not required.
 
-This can be represented by a conditional normalising flow, spline density, mixture model, neural density estimator, or another normalised density model.
-
-3. For each lens bin $\ell$, form the model-implied density:
-
-$$
-\hat{n}^L_{\ell,\theta}(z) = \sum_s p(i_S = s \mid i_L = \ell) q_\theta(z \mid i_L = \ell, i_S = s).
-$$
-
-4. For each source bin $s$, form the model-implied density:
-
-$$
-\hat{n}^S_{s,\theta}(z) = \sum_\ell p(i_L = \ell \mid i_S = s) q_\theta(z \mid i_L = \ell, i_S = s).
-$$
-
-5. Optimise the KL objective:
-
-$$
-\mathcal{L}_{\mathrm{KL}}(\theta) = -\sum_\ell \int n^L_\ell(z) \log \hat{n}^L_{\ell,\theta}(z)\,dz - \sum_s \int n^S_s(z) \log \hat{n}^S_{s,\theta}(z)\,dz + \mathrm{constant}.
-$$
-
-Optionally include regularisation toward a reference density.
-
-6. After training, assign each galaxy $g$ a redshift by sampling:
+4. After training, assign each galaxy $g$ a redshift by sampling:
 
 $$
 z_g \sim q_\theta(z \mid i_L(g), i_S(g)).
 $$
 
-This produces a redshift assignment whose lens-bin and source-bin ensembles approximately reproduce the supplied redshift densities, subject to the compatibility of the input $n(z)$ distributions, the expressivity of the learned conditional density, and the chosen regularisation.
+This produces a redshift assignment whose lens-bin and source-bin ensembles approximately reproduce the supplied redshift densities, subject to the compatibility of the input $n(z)$ distributions and the expressivity of the learned conditional density.
+
+---
+
+## Demo / usage
+
+A self-contained reference implementation in PyTorch is provided here:
+
+- [`mcra.py`](mcra.py) — the implementation. The conditional density $q_\theta(z\mid i_L, i_S)$ is a conditional rational-quadratic neural spline flow ([`zuko.flows.NSF`](https://zuko.readthedocs.io/)). It contains the Smail-type demo data generator (`make_demo_data`), the flow (`ConditionalRedshiftFlow`), the model-implied lens/source mixtures, the forward-KL training loop (`train`), and plotting/metric helpers.
+- [`demo.ipynb`](demo.ipynb) — an end-to-end walkthrough on a synthetic universe with **3 lens bins and 3 source bins**, all overlapping, with the lens bins at slightly lower redshift than the source bins. It generates the data, trains the flow, and shows that the model-implied marginals and the sampled-catalogue redshifts reproduce the supplied per-bin $n(z)$.
+
+### Setup
+
+The only extra dependency beyond PyTorch / NumPy / Matplotlib is `zuko`:
+
+```bash
+pip install zuko
+```
+
+### Run
+
+Open and run [`demo.ipynb`](demo.ipynb) top to bottom, or use the module directly:
+
+```python
+import mcra
+
+data = mcra.make_demo_data()                       # synthetic 3-lens / 3-source problem
+model = mcra.ConditionalRedshiftFlow(
+    data.n_lens, data.n_source, data.z_mean, data.z_std
+)
+mcra.train(model, data, mcra.TrainConfig(steps=2000))
+
+# assign redshifts to a catalogue of (i_L, i_S) labels
+i_l, i_s, _ = mcra.sample_catalogue(data, n=100_000)
+z = mcra.assign_redshifts(model, i_l, i_s)
+```
+
+### A note on the explicit regularisation term
+
+The formalism above includes an optional regularisation term $\lambda\sum_{\ell,s}\mathrm{KL}\big(q_\theta(\cdot\mid\ell,s)\,\|\,r\big)$ to pick a particular solution among the many couplings consistent with the marginals. We tested this in the demo and found that **it did not improve the result** — with any non-trivial weight it degraded the recovered conditionals (most visibly in sparsely-populated $(\ell,s)$ cells), and the marginal fit got worse, since the objective is a soft weighted sum rather than a hard constraint.
+
+The likely explanation is that the explicit term was **fighting the implicit regularisation (inductive bias) already built into the flow**. The conditional density is not a free per-cell object: it is produced by a single amortised conditioner network with weights shared across all $(\ell,s)$ (an additive lens-embedding + source-embedding fed through a shared MLP), restricted to smooth monotonic rational-quadratic spline transforms of a Gaussian base, and trained from a near-identity initialisation. These choices already select a smooth, sensible solution in the underdetermined directions — for example, an almost-empty cell is reconstructed from its lens-row and source-column neighbours rather than left arbitrary. Adding an explicit reference (a broad Gaussian, deliberately *not* a Smail) simply competed with this better-matched implicit prior.
+
+Accordingly, the explicit regularisation term has been **removed from the implementation**: `mcra.train` optimises the forward-KL objective alone, and the flow's own inductive bias does the work of selecting a solution. (It could be reinstated with a carefully chosen reference for genuinely incompatible inputs, but it was not helpful here.)
